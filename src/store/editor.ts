@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia'
-import type { Cue, EditorDocument, Locale, Snapshot } from '../types'
+import type { Cue, DurationCheck, EditorDocument, ExportBlocker, Locale, Snapshot } from '../types'
 import { loadDocument, saveDocument } from '../utils/db'
 import { makeId } from '../utils/id'
+import { buildCueSignature, evaluateCue, findExportBlockers, isCheckStale } from '../utils/duration'
 import { parseScript, parseSrt, toSrt } from '../utils/subtitle'
 import { translate, type MessageKey } from '../i18n'
 
@@ -39,6 +40,7 @@ const createDefaultDocument = (): EditorDocument => ({
     { id: 'cue-demo-05', start: 19, end: 25.1, source: '那次修改很小，却让新用户第一次能够顺利完成安装。', target: '那次修改很小，却让新用户第一次顺利完成安装。', actorId: 'actor-lin', speed: 0.98, termIds: [], status: 'issue', locked: false },
     { id: 'cue-demo-06', start: 25.4, end: 31.2, source: '所以我们决定把安装说明拆开，并为每个平台补上验证步骤。', target: '因此，我们拆分安装说明，并为每个平台补上验证步骤。', actorId: 'actor-chen', speed: 1.05, termIds: [], status: 'draft', locked: false },
   ],
+  durationChecks: [],
   snapshots: [],
 })
 
@@ -74,6 +76,21 @@ export const useEditorStore = defineStore('subtitle-editor', {
     totalDuration(state): number {
       return Math.max(10, ...state.document.cues.map((cue) => cue.end)) * 1.04
     },
+    durationCheckMap(state): Map<string, DurationCheck> {
+      return new Map((state.document.durationChecks ?? []).map((check) => [check.cueId, check]))
+    },
+    staleCheckCount(): number {
+      return this.document.cues.filter((cue) => isCheckStale(this.durationCheckMap.get(cue.id), cue, this.document.language)).length
+    },
+    unresolvedOvertimeCount(): number {
+      return this.document.cues.filter((cue) => {
+        const check = this.durationCheckMap.get(cue.id)
+        return check && !isCheckStale(check, cue, this.document.language) && check.overtime && !check.note.trim()
+      }).length
+    },
+    exportBlockers(): ExportBlocker[] {
+      return findExportBlockers(this.document.cues, this.document.durationChecks, this.document.language)
+    },
   },
   actions: {
     async initialize() {
@@ -81,6 +98,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
       this.online = navigator.onLine
       const stored = await loadDocument(DOCUMENT_ID)
       if (stored) {
+        if (!stored.durationChecks) stored.durationChecks = []
         this.document = stored
         this.lastSeenRevision = stored.revision
       } else {
@@ -102,6 +120,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
           }
           const latest = await loadDocument(DOCUMENT_ID)
           if (latest && latest.revision > this.lastSeenRevision) {
+            if (!latest.durationChecks) latest.durationChecks = []
             this.document = latest
             this.lastSeenRevision = latest.revision
             this.saveState = 'saved'
@@ -189,6 +208,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
     async loadLatest() {
       const latest = await loadDocument(DOCUMENT_ID)
       if (!latest) return
+      if (!latest.durationChecks) latest.durationChecks = []
       this.document = latest
       this.lastSeenRevision = latest.revision
       this.conflict = false
@@ -305,9 +325,52 @@ export const useEditorStore = defineStore('subtitle-editor', {
       this.commit('import', (current) => {
         current.splice(0, current.length, ...cues)
       }, cues[0].id)
+      // 整批替换台词后，旧核对记录全部失效作废
+      this.document.durationChecks = []
+      this.markChanged('import-duration-reset')
       return cues.length
     },
+    /** 重新核对指定台词（不传 id 则核对全部）。超时行已填写的处理说明予以保留 */
+    runDurationCheck(cueIds?: string[]) {
+      const targets = new Set(cueIds ?? this.document.cues.map((cue) => cue.id))
+      const language = this.document.language
+      const previous = new Map(this.document.durationChecks.map((check) => [check.cueId, check]))
+      const results: DurationCheck[] = []
+      for (const cue of this.document.cues) {
+        if (targets.has(cue.id)) {
+          results.push({
+            cueId: cue.id,
+            signature: buildCueSignature(cue, language),
+            checkedAt: Date.now(),
+            note: previous.get(cue.id)?.note ?? '',
+            ...evaluateCue(cue, language),
+          })
+        } else if (previous.has(cue.id)) {
+          results.push(previous.get(cue.id)!)
+        }
+      }
+      this.document.durationChecks = results
+      this.markChanged('duration-check')
+    },
+    setDurationNote(cueId: string, note: string) {
+      const existing = this.document.durationChecks.find((check) => check.cueId === cueId)
+      if (existing) {
+        existing.note = note
+      } else {
+        const cue = this.document.cues.find((item) => item.id === cueId)
+        if (!cue) return
+        this.document.durationChecks.push({
+          cueId,
+          signature: buildCueSignature(cue, this.document.language),
+          checkedAt: Date.now(),
+          note,
+          ...evaluateCue(cue, this.document.language),
+        })
+      }
+      this.markChanged('duration-note')
+    },
     exportSrt() {
+      if (this.exportBlockers.length) return false
       const blob = new Blob([toSrt(this.document.cues)], { type: 'text/plain;charset=utf-8' })
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
@@ -315,6 +378,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
       anchor.download = `${this.document.title || 'subtitle'}.srt`
       anchor.click()
       URL.revokeObjectURL(url)
+      return true
     },
   },
 })

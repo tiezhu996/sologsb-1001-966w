@@ -4,11 +4,12 @@ import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Clock, Delete, DocumentCopy, Download, EditPen, Files, Lock, MagicStick, Monitor,
-  RefreshLeft, RefreshRight, Search, Unlock, UploadFilled,
+  RefreshLeft, RefreshRight, Search, Unlock, UploadFilled, VideoPlay,
 } from '@element-plus/icons-vue'
 import { useEditorStore } from './store/editor'
-import type { Cue, CueConflict } from './types'
+import type { Cue, CueConflict, DurationCheck, Locale } from './types'
 import { formatTime } from './utils/subtitle'
+import { estimateRecordingSeconds, isCheckStale } from './utils/duration'
 
 const store = useEditorStore()
 const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, online, timelineZoom, actorFilter } = storeToRefs(store)
@@ -16,6 +17,11 @@ const fileInput = ref<HTMLInputElement>()
 const snapshotDialog = ref(false)
 const snapshotName = ref('')
 const search = ref('')
+type CenterView = 'cues' | 'duration'
+type DurationRow = { cue: Cue; check: DurationCheck | undefined; stale: boolean; live: number; liveRate: number }
+const BASE_RATE: Record<Locale, number> = { 'zh-CN': 4, 'en-US': 2.6, 'ja-JP': 5.5 }
+const centerView = ref<CenterView>('cues')
+const exportBlockDialog = ref(false)
 
 const filteredCues = computed(() => {
   const query = search.value.trim().toLowerCase()
@@ -84,6 +90,63 @@ function requestDelete(id: string) {
     .then(() => store.deleteCue(id))
     .catch(() => undefined)
 }
+const durationRows = computed(() => filteredCues.value.map((cue) => {
+  const check = store.durationCheckMap.get(cue.id)
+  const stale = isCheckStale(check, cue, project.value.language)
+  return {
+    cue,
+    check: stale ? undefined : check,
+    stale,
+    live: estimateRecordingSeconds(cue.target, cue.speed, project.value.language),
+    liveRate: Math.round(BASE_RATE[project.value.language] * cue.speed * 100) / 100,
+  }
+}))
+const rateUnit = computed(() => project.value.language === 'en-US' ? store.t('dcUnitWord') : store.t('dcUnitChar'))
+const blockerSummary = computed(() => {
+  const blockers = store.exportBlockers
+  const stale = blockers.filter((item) => item.kind === 'stale').length
+  const unresolved = blockers.length - stale
+  return { stale, unresolved }
+})
+function rowWindow(row: DurationRow) {
+  return Math.max(0, Math.round((row.cue.end - row.cue.start) * 100) / 100)
+}
+function statusTag(check: DurationCheck | undefined, stale: boolean) {
+  if (stale || !check) return { type: 'warning' as const, text: stale && check ? store.t('dcStatusStale') : store.t('dcStatusNone') }
+  if (check.overtime) return { type: 'danger' as const, text: store.t('dcStatusOvertime', { excess: check.excess }) }
+  return { type: 'success' as const, text: store.t('dcStatusOk') }
+}
+function onDurationRowClick(row: DurationRow) {
+  store.selectCue(row.cue.id)
+}
+function durationRowClass(data: { row: DurationRow }) {
+  return `dc-row${data.row.check?.overtime ? ' overtime' : ''}${data.row.stale ? ' stale' : ''}`
+}
+function runAllChecks() {
+  store.runDurationCheck()
+}
+function runRowCheck(id: string) {
+  store.runDurationCheck([id])
+}
+function onNoteInput(id: string, value: unknown) {
+  store.setDurationNote(id, String(value))
+}
+function requestExportSrt() {
+  if (store.exportBlockers.length) {
+    exportBlockDialog.value = true
+    return
+  }
+  store.exportSrt()
+}
+function goRecheck() {
+  exportBlockDialog.value = false
+  centerView.value = 'duration'
+  runAllChecks()
+}
+function goDurationSheet() {
+  exportBlockDialog.value = false
+  centerView.value = 'duration'
+}
 function createSnapshot() {
   store.createSnapshot(snapshotName.value)
   snapshotName.value = ''
@@ -145,7 +208,7 @@ const handleOffline = () => setOnline(false)
         <span class="save-state" :class="saveState"><i />{{ saveLabel }}</span>
         <input ref="fileInput" class="file-input" type="file" accept=".srt,.txt,text/plain" @change="importFile" />
         <el-button :icon="UploadFilled" @click="fileInput?.click()">{{ store.t('import') }}</el-button>
-        <el-button :icon="Download" @click="store.exportSrt">{{ store.t('export') }}</el-button>
+        <el-button :icon="Download" @click="requestExportSrt">{{ store.t('export') }}</el-button>
         <el-button type="primary" :icon="DocumentCopy" @click="snapshotDialog = true">{{ store.t('snapshot') }}</el-button>
       </div>
     </header>
@@ -207,6 +270,17 @@ const handleOffline = () => setOnline(false)
           </div>
         </div>
 
+        <div class="view-switch">
+          <el-radio-group v-model="centerView" size="small">
+            <el-radio-button value="cues">{{ store.t('viewCues') }}</el-radio-button>
+            <el-radio-button value="duration">
+              {{ store.t('viewDuration') }}
+              <i v-if="store.staleCheckCount || store.unresolvedOvertimeCount" class="view-badge" :class="{ alert: store.unresolvedOvertimeCount }">{{ store.staleCheckCount + store.unresolvedOvertimeCount }}</i>
+            </el-radio-button>
+          </el-radio-group>
+        </div>
+
+        <template v-if="centerView === 'cues'">
         <div class="timeline-card">
           <div class="section-heading">
             <span><el-icon><Clock /></el-icon>{{ store.t('timeline') }}</span>
@@ -258,6 +332,78 @@ const handleOffline = () => setOnline(false)
           </article>
           <div v-if="!filteredCues.length" class="empty-state">{{ store.t('empty') }}</div>
         </div>
+        </template>
+
+        <section v-else class="duration-sheet">
+          <div class="duration-toolbar">
+            <div class="duration-summary">
+              <el-icon><VideoPlay /></el-icon>
+              <strong>{{ store.t('durationCheck') }}</strong>
+              <el-tag v-if="store.staleCheckCount" size="small" type="warning">{{ store.t('dcStaleCount', { count: store.staleCheckCount }) }}</el-tag>
+              <el-tag v-if="store.unresolvedOvertimeCount" size="small" type="danger">{{ store.t('dcOvertimeCount', { count: store.unresolvedOvertimeCount }) }}</el-tag>
+              <el-tag v-if="!store.staleCheckCount && !store.unresolvedOvertimeCount && durationRows.length" size="small" type="success">{{ store.t('dcAllClear') }}</el-tag>
+            </div>
+            <el-button size="small" type="primary" plain @click="runAllChecks">{{ store.t('rerunAll') }}</el-button>
+          </div>
+          <p class="duration-hint">{{ store.t('durationHint') }}</p>
+
+          <el-table :data="durationRows" size="small" class="duration-table" :row-class-name="durationRowClass" @row-click="onDurationRowClick">
+            <el-table-column width="56" label="#">
+              <template #default="{ $index }">{{ String($index + 1).padStart(2, '0') }}</template>
+            </el-table-column>
+            <el-table-column min-width="200" :label="store.t('target')">
+              <template #default="{ row }">
+                <span class="actor-pill" :style="{ '--actor': actorColor(row.cue.actorId) }">{{ actorName(row.cue.actorId) }}</span>
+                <p class="dc-target" :class="{ empty: !row.cue.target }">{{ row.cue.target || store.t('dcEmptyTarget') }}</p>
+              </template>
+            </el-table-column>
+            <el-table-column width="148" :label="store.t('timecode')">
+              <template #default="{ row }">
+                <code>{{ formatTime(row.cue.start) }}<br />→ {{ formatTime(row.cue.end) }}</code>
+              </template>
+            </el-table-column>
+            <el-table-column width="84" :label="store.t('dcWindow')">
+              <template #default="{ row }">{{ rowWindow(row).toFixed(1) }} {{ store.t('dcSeconds') }}</template>
+            </el-table-column>
+            <el-table-column width="128" :label="store.t('dcEstimated')">
+              <template #default="{ row }">
+                <b :class="{ over: row.live > rowWindow(row) }">{{ row.live ? `${row.live.toFixed(1)} ${store.t('dcSeconds')}` : '—' }}</b>
+                <small>{{ store.t('dcRateHint', { rate: row.liveRate, unit: rateUnit, speed: row.cue.speed }) }}</small>
+                <small v-if="row.check && !row.stale">{{ store.t('dcCheckedAt', { time: new Date(row.check.checkedAt).toLocaleTimeString() }) }}</small>
+              </template>
+            </el-table-column>
+            <el-table-column width="118" :label="store.t('dcOvertime')">
+              <template #default="{ row }">
+                <template v-if="row.check && !row.stale">
+                  <span v-if="row.check.overtime" class="dc-over">+{{ row.check.excess.toFixed(1) }} {{ store.t('dcSeconds') }}</span>
+                  <span v-else class="dc-fit">0</span>
+                </template>
+                <span v-else class="dc-pending">{{ store.t('dcLiveEstimate') }}：{{ row.live ? `${row.live.toFixed(1)}` : '—' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column width="116" :label="store.t('dcStatus')">
+              <template #default="{ row }">
+                <el-tag size="small" :type="statusTag(row.check, row.stale).type">{{ statusTag(row.check, row.stale).text }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column min-width="210" :label="store.t('dcNote')">
+              <template #default="{ row }">
+                <el-input
+                  :model-value="row.check?.note ?? ''" size="small" :placeholder="store.t('dcNotePlaceholder')"
+                  :class="{ required: row.check?.overtime && !(row.check.note || '').trim() }"
+                  :disabled="!row.check || row.stale"
+                  @click.stop @change="onNoteInput(row.cue.id, $event)"
+                />
+              </template>
+            </el-table-column>
+            <el-table-column width="84" align="right">
+              <template #default="{ row }">
+                <el-button size="small" text @click.stop="runRowCheck(row.cue.id)">{{ store.t('rerunRow') }}</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+          <div v-if="!durationRows.length" class="empty-state">{{ store.t('empty') }}</div>
+        </section>
       </section>
 
       <aside class="right-panel panel">
@@ -316,6 +462,17 @@ const handleOffline = () => setOnline(false)
       <span><kbd>L</kbd> {{ store.t('shortcutLock') }}</span>
       <span><kbd>Ctrl/⌘ Z</kbd> {{ store.t('shortcutUndo') }}</span>
     </footer>
+
+    <el-dialog v-model="exportBlockDialog" :title="blockerSummary.stale ? store.t('dcExportStaleTitle') : store.t('dcExportOvertimeTitle')" width="460px">
+      <div class="export-block-body">
+        <p v-if="blockerSummary.stale">{{ store.t('dcExportStaleBody', { count: blockerSummary.stale }) }}</p>
+        <p v-if="blockerSummary.unresolved">{{ store.t('dcExportOvertimeBody', { count: blockerSummary.unresolved }) }}</p>
+      </div>
+      <template #footer>
+        <el-button v-if="blockerSummary.stale" type="primary" @click="goRecheck">{{ store.t('rerunAll') }}</el-button>
+        <el-button @click="goDurationSheet">{{ store.t('dcReviewNow') }}</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="snapshotDialog" :title="store.t('snapshot')" width="460px">
       <el-input v-model="snapshotName" :placeholder="store.t('newSnapshotName')" @keyup.enter="createSnapshot" />
