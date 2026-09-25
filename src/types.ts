@@ -35,6 +35,18 @@ export interface Snapshot {
   cues: Cue[]
 }
 
+export interface DurationCheck {
+  id: string
+  cueId: string
+  fingerprint: string
+  estimated: number
+  window: number
+  over: boolean
+  overBy: number
+  note: string
+  checkedAt: number
+}
+
 export interface EditorDocument {
   id: string
   title: string
@@ -43,6 +55,7 @@ export interface EditorDocument {
   actors: Actor[]
   terms: Term[]
   snapshots: Snapshot[]
+  durationChecks: DurationCheck[]
   updatedAt: number
   revision: number
   lastWriter: string

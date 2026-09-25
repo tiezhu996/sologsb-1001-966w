@@ -133,3 +133,11 @@ kbd { padding: 2px 5px; border: 1px solid #5a6981; border-radius: 4px; color: wh
   .cue-row { grid-template-columns: 34px minmax(0, 1fr); }
   .cue-quick-actions { grid-column: 2; }
 }
+.check-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.check-intro { margin: 0; color: #66748a; font-size: 12px; }
+.check-cue { display: flex; align-items: center; gap: 6px; }
+.check-cue-text { color: #4a5a72; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.over-by { color: #c0452d; font-weight: 600; }
+.over-row { background: #fdf3f0; }
+.stale-hint { margin: 14px 0 6px; color: #8a94a6; font-size: 12px; }
+.stale-table { opacity: 0.72; }

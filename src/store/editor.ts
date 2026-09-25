@@ -1,8 +1,9 @@
 import { defineStore } from 'pinia'
-import type { Cue, EditorDocument, Locale, Snapshot } from '../types'
+import type { Cue, DurationCheck, EditorDocument, Locale, Snapshot } from '../types'
 import { loadDocument, saveDocument } from '../utils/db'
 import { makeId } from '../utils/id'
 import { parseScript, parseSrt, toSrt } from '../utils/subtitle'
+import { cueFingerprint, estimateSeconds, round1 } from '../utils/duration'
 import { translate, type MessageKey } from '../i18n'
 
 const DOCUMENT_ID = 'subtitle-dubbing-document'
@@ -40,6 +41,7 @@ const createDefaultDocument = (): EditorDocument => ({
     { id: 'cue-demo-06', start: 25.4, end: 31.2, source: '所以我们决定把安装说明拆开，并为每个平台补上验证步骤。', target: '因此，我们拆分安装说明，并为每个平台补上验证步骤。', actorId: 'actor-chen', speed: 1.05, termIds: [], status: 'draft', locked: false },
   ],
   snapshots: [],
+  durationChecks: [],
 })
 
 type SaveState = 'saved' | 'dirty' | 'saving' | 'conflict'
@@ -74,6 +76,21 @@ export const useEditorStore = defineStore('subtitle-editor', {
     totalDuration(state): number {
       return Math.max(10, ...state.document.cues.map((cue) => cue.end)) * 1.04
     },
+    durationRows(state) {
+      const language = state.document.language
+      return state.document.durationChecks
+        .map((check) => {
+          const cue = state.document.cues.find((item) => item.id === check.cueId)
+          const stale = !cue || cueFingerprint(cue, language) !== check.fingerprint
+          return { check, cue, stale, handled: check.note.trim().length > 0 }
+        })
+        .sort((a, b) => b.check.checkedAt - a.check.checkedAt)
+    },
+    unresolvedOvertime(): { check: DurationCheck; cue: Cue | undefined }[] {
+      return this.durationRows
+        .filter((row) => !row.stale && row.check.over && !row.handled)
+        .map((row) => ({ check: row.check, cue: row.cue }))
+    },
   },
   actions: {
     async initialize() {
@@ -81,6 +98,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
       this.online = navigator.onLine
       const stored = await loadDocument(DOCUMENT_ID)
       if (stored) {
+        stored.durationChecks = stored.durationChecks ?? []
         this.document = stored
         this.lastSeenRevision = stored.revision
       } else {
@@ -189,6 +207,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
     async loadLatest() {
       const latest = await loadDocument(DOCUMENT_ID)
       if (!latest) return
+      latest.durationChecks = latest.durationChecks ?? []
       this.document = latest
       this.lastSeenRevision = latest.revision
       this.conflict = false
@@ -307,7 +326,45 @@ export const useEditorStore = defineStore('subtitle-editor', {
       }, cues[0].id)
       return cues.length
     },
-    exportSrt() {
+    runDurationCheck() {
+      const language = this.document.language
+      const checks = this.document.durationChecks
+      for (const cue of this.document.cues) {
+        const fingerprint = cueFingerprint(cue, language)
+        const estimated = estimateSeconds(cue.target || cue.source, cue.speed, language)
+        const window = round1(Math.max(0, cue.end - cue.start))
+        const overBy = round1(estimated - window)
+        const existing = checks.find((item) => item.cueId === cue.id && item.fingerprint === fingerprint)
+        if (existing) {
+          existing.estimated = estimated
+          existing.window = window
+          existing.over = overBy > 0
+          existing.overBy = Math.max(0, overBy)
+          existing.checkedAt = Date.now()
+        } else {
+          checks.push({
+            id: makeId('check'),
+            cueId: cue.id,
+            fingerprint,
+            estimated,
+            window,
+            over: overBy > 0,
+            overBy: Math.max(0, overBy),
+            note: '',
+            checkedAt: Date.now(),
+          })
+        }
+      }
+      this.markChanged('duration-check', true)
+    },
+    setCheckNote(checkId: string, note: string) {
+      const check = this.document.durationChecks.find((item) => item.id === checkId)
+      if (!check) return
+      check.note = note
+      this.markChanged('duration-check-note', true)
+    },
+    exportSrt(): boolean {
+      if (this.unresolvedOvertime.length) return false
       const blob = new Blob([toSrt(this.document.cues)], { type: 'text/plain;charset=utf-8' })
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
@@ -315,6 +372,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
       anchor.download = `${this.document.title || 'subtitle'}.srt`
       anchor.click()
       URL.revokeObjectURL(url)
+      return true
     },
   },
 })

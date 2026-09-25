@@ -4,7 +4,7 @@ import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Clock, Delete, DocumentCopy, Download, EditPen, Files, Lock, MagicStick, Monitor,
-  RefreshLeft, RefreshRight, Search, Unlock, UploadFilled,
+  RefreshLeft, RefreshRight, Search, Timer, Unlock, UploadFilled,
 } from '@element-plus/icons-vue'
 import { useEditorStore } from './store/editor'
 import type { Cue, CueConflict } from './types'
@@ -16,6 +16,7 @@ const fileInput = ref<HTMLInputElement>()
 const snapshotDialog = ref(false)
 const snapshotName = ref('')
 const search = ref('')
+const checkDialog = ref(false)
 
 const filteredCues = computed(() => {
   const query = search.value.trim().toLowerCase()
@@ -32,6 +33,24 @@ const actorColor = (id: string) => project.value.actors.find((actor) => actor.id
 const actorName = (id: string) => project.value.actors.find((actor) => actor.id === id)?.name ?? '—'
 const statusLabel = (status: Cue['status']) => store.t(status)
 const statusType = (status: Cue['status']) => status === 'reviewed' ? 'success' : status === 'issue' ? 'danger' : 'info'
+
+const activeChecks = computed(() => store.durationRows.filter((row) => !row.stale))
+const staleChecks = computed(() => store.durationRows.filter((row) => row.stale))
+const unresolvedCount = computed(() => store.unresolvedOvertime.length)
+const overtimeCueIds = computed(() => new Set(store.unresolvedOvertime.map((row) => row.check.cueId)))
+const cueIndex = (cueId: string) => project.value.cues.findIndex((cue) => cue.id === cueId) + 1
+const checkRowClass = ({ row }: { row: { check: { over: boolean }; handled: boolean } }) => row.check.over && !row.handled ? 'over-row' : ''
+
+function runCheck() {
+  store.runDurationCheck()
+  const over = activeChecks.value.filter((row) => row.check.over).length
+  ElMessage({ message: store.t('checkDone', { over, total: activeChecks.value.length }), type: over ? 'warning' : 'success' })
+}
+function requestExport() {
+  if (store.exportSrt()) return
+  ElMessage.warning(store.t('exportBlocked', { count: unresolvedCount.value }))
+  checkDialog.value = true
+}
 
 function updateSelected(patch: Partial<Cue>, label = 'update-cue') {
   if (selectedCue.value) store.updateCue(selectedCue.value.id, patch, label)
@@ -145,7 +164,10 @@ const handleOffline = () => setOnline(false)
         <span class="save-state" :class="saveState"><i />{{ saveLabel }}</span>
         <input ref="fileInput" class="file-input" type="file" accept=".srt,.txt,text/plain" @change="importFile" />
         <el-button :icon="UploadFilled" @click="fileInput?.click()">{{ store.t('import') }}</el-button>
-        <el-button :icon="Download" @click="store.exportSrt">{{ store.t('export') }}</el-button>
+        <el-badge :value="unresolvedCount" :hidden="!unresolvedCount" type="danger">
+          <el-button :icon="Timer" @click="checkDialog = true">{{ store.t('durationCheck') }}</el-button>
+        </el-badge>
+        <el-button :icon="Download" @click="requestExport">{{ store.t('export') }}</el-button>
         <el-button type="primary" :icon="DocumentCopy" @click="snapshotDialog = true">{{ store.t('snapshot') }}</el-button>
       </div>
     </header>
@@ -244,6 +266,7 @@ const handleOffline = () => setOnline(false)
                 <span class="actor-pill" :style="{ '--actor': actorColor(cue.actorId) }">{{ actorName(cue.actorId) }}</span>
                 <code>{{ formatTime(cue.start) }} → {{ formatTime(cue.end) }}</code>
                 <el-tag size="small" :type="statusType(cue.status)">{{ statusLabel(cue.status) }}</el-tag>
+                <el-tag v-if="overtimeCueIds.has(cue.id)" size="small" type="danger" effect="dark">{{ store.t('checkOver') }}</el-tag>
                 <el-icon v-if="cue.locked"><Lock /></el-icon>
                 <span class="cue-warning-count" v-if="cueWarnings(cue).length">{{ cueWarnings(cue).length }} context</span>
               </div>
@@ -316,6 +339,78 @@ const handleOffline = () => setOnline(false)
       <span><kbd>L</kbd> {{ store.t('shortcutLock') }}</span>
       <span><kbd>Ctrl/⌘ Z</kbd> {{ store.t('shortcutUndo') }}</span>
     </footer>
+
+    <el-dialog v-model="checkDialog" :title="store.t('durationCheck')" width="860px">
+      <div class="check-toolbar">
+        <p class="check-intro">{{ store.t('checkIntro', { locale: project.language }) }}</p>
+        <el-button type="primary" size="small" :icon="Timer" @click="runCheck">{{ store.t('runCheck') }}</el-button>
+      </div>
+      <el-table v-if="activeChecks.length" :data="activeChecks" size="small" :row-class-name="checkRowClass">
+        <el-table-column :label="store.t('colCue')" min-width="200">
+          <template #default="{ row }">
+            <div class="check-cue">
+              <b>#{{ cueIndex(row.check.cueId) }}</b>
+              <span class="actor-pill" :style="{ '--actor': actorColor(row.cue?.actorId ?? '') }">{{ actorName(row.cue?.actorId ?? '') }}</span>
+            </div>
+            <div class="check-cue-text">{{ row.cue?.target || row.cue?.source }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column :label="store.t('colWindow')" width="90" align="right">
+          <template #default="{ row }">{{ store.t('seconds', { value: row.check.window.toFixed(1) }) }}</template>
+        </el-table-column>
+        <el-table-column :label="store.t('colEstimated')" width="90" align="right">
+          <template #default="{ row }">{{ store.t('seconds', { value: row.check.estimated.toFixed(1) }) }}</template>
+        </el-table-column>
+        <el-table-column :label="store.t('colOver')" width="90" align="right">
+          <template #default="{ row }">
+            <span v-if="row.check.over" class="over-by">+{{ store.t('seconds', { value: row.check.overBy.toFixed(1) }) }}</span>
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
+        <el-table-column :label="store.t('colCheckStatus')" width="110">
+          <template #default="{ row }">
+            <el-tag size="small" :type="!row.check.over ? 'success' : row.handled ? 'warning' : 'danger'">
+              {{ !row.check.over ? store.t('checkNormal') : row.handled ? store.t('checkHandled') : store.t('checkOver') }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column :label="store.t('colNote')" min-width="200">
+          <template #default="{ row }">
+            <el-input
+              v-if="row.check.over" :model-value="row.check.note" size="small" type="textarea" :rows="1" autosize
+              :placeholder="store.t('notePlaceholder')" @change="store.setCheckNote(row.check.id, String($event))"
+            />
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
+      </el-table>
+      <p v-else class="empty-state">{{ store.t('noChecks') }}</p>
+      <template v-if="staleChecks.length">
+        <p class="stale-hint">{{ store.t('staleHint') }}</p>
+        <el-table :data="staleChecks" size="small" class="stale-table">
+          <el-table-column :label="store.t('colCue')" min-width="200">
+            <template #default="{ row }">
+              <div class="check-cue-text">{{ row.cue?.target || row.cue?.source || row.check.cueId }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column :label="store.t('colEstimated')" width="90" align="right">
+            <template #default="{ row }">{{ store.t('seconds', { value: row.check.estimated.toFixed(1) }) }}</template>
+          </el-table-column>
+          <el-table-column :label="store.t('colOver')" width="90" align="right">
+            <template #default="{ row }">
+              <span v-if="row.check.over">+{{ store.t('seconds', { value: row.check.overBy.toFixed(1) }) }}</span>
+              <span v-else>—</span>
+            </template>
+          </el-table-column>
+          <el-table-column :label="store.t('colCheckStatus')" width="110">
+            <template #default><el-tag size="small" type="info">{{ store.t('checkStale') }}</el-tag></template>
+          </el-table-column>
+          <el-table-column :label="store.t('colNote')" min-width="160">
+            <template #default="{ row }">{{ row.check.note || '—' }}</template>
+          </el-table-column>
+        </el-table>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="snapshotDialog" :title="store.t('snapshot')" width="460px">
       <el-input v-model="snapshotName" :placeholder="store.t('newSnapshotName')" @keyup.enter="createSnapshot" />
